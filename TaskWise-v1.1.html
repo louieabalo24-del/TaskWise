@@ -2622,7 +2622,12 @@ window.TASKWISE_DATA = {
   "use strict";
   var D = window.TASKWISE_DATA, ui = TW.ui, esc = ui.esc, icon = TW.icon, KEY = "survey", R = TW.stats.round2;
   var KIND = { diff: { scale: "difficulty", name: "Difficulty", pre: "d" }, freq: { scale: "frequency", name: "Practice frequency", pre: "p" } };
-  var st = null, tab = "build", armed = false, body = null, seq = 0;
+  var st = null, tab = "build", armed = false, body = null, seq = 0, shellEl = null, rootMain = null;
+  var sh = null, shInit = false, defTimer = null;
+  /* Paste the public Google Form link between the quotes (must start with https://). Leave empty to hide the card. */
+  var FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSdSo5jbsLGCJLpYhSIz8QF_a7QbNYaJlgj4ntoFFhrl56IFkA/viewform";   /* sh: shared (database) mode, set once the viewer is connected */
+  function resps() { return sh && sh.editor ? sh.resp : st.resp; }
+  function respondOnly() { return !!(sh && !sh.editor); }
 
   var css = document.createElement("style");
   css.textContent = `
@@ -2649,10 +2654,20 @@ window.TASKWISE_DATA = {
   document.head.appendChild(css);
 
   function load() {
+    if (respondOnly()) { st = { title: (sh.def && sh.def.title) || "Survey", qs: (sh.def && sh.def.qs) || [], resp: [] }; return; }
     var s = ui.store.get(KEY, null);
     st = s && Array.isArray(s.qs) && Array.isArray(s.resp) ? s : { title: "My class survey", qs: [], resp: [] };
   }
-  function save() { ui.store.set(KEY, st); }
+  function save() {
+    if (respondOnly()) return;
+    ui.store.set(KEY, st);
+    if (sh && sh.editor) { clearTimeout(defTimer); defTimer = setTimeout(pushDef, 900); }
+  }
+  function pushDef() {
+    if (!sh || !sh.editor) return;
+    sh.db.doc("survey/def").set({ title: st.title, qs: st.qs.map(function (q) { return { id: q.id, group: q.group || "", text: q.text || "", kind: q.kind === "freq" ? "freq" : "diff" }; }), updated: Date.now() })
+      .catch(function () { ui.toast("Could not publish the survey to respondents."); });
+  }
   function nid() { return "q" + Date.now().toString(36) + (++seq); }
   function labels(k) { return D.scales[KIND[k].scale].values.map(function (v) { return v.label; }); }
   function levelOf(b, k) { return b ? (k === "diff" ? b.severity : b.label) : ""; }
@@ -2686,7 +2701,7 @@ window.TASKWISE_DATA = {
   function stats() {
     var byQ = st.qs.map(function (q) {
       var c = [0, 0, 0, 0];
-      st.resp.forEach(function (r) { var v = r.a[q.id]; if (v >= 1 && v <= 4) c[v - 1]++; });
+      resps().forEach(function (r) { var v = r.a[q.id]; if (v >= 1 && v <= 4) c[v - 1]++; });
       var n = c[0] + c[1] + c[2] + c[3];
       var mean = n ? (c[0] + 2 * c[1] + 3 * c[2] + 4 * c[3]) / n : null;
       return { q: q, c: c, n: n, mean: mean, band: mean == null ? null : TW.stats.bandFor(mean, D.scales[KIND[q.kind].scale].bands) };
@@ -2713,6 +2728,55 @@ window.TASKWISE_DATA = {
     return rows.map(function (r) { return r.map(TW.templates.csvEscape).join(","); }).join("\r\n");
   }
 
+  /* ---------- export the built survey as a Google Form (Apps Script) ---------- */
+  function formScript() {
+    var sections = [], idx = {};
+    st.qs.forEach(function (q) {
+      var text = (q.text || "").trim(); if (!text) return;
+      var name = (q.group || "").trim() || "General", key = name + "|" + q.kind;
+      if (!idx[key]) { idx[key] = { title: name, kind: q.kind, rows: [] }; sections.push(idx[key]); }
+      var t = text, n = 2; while (idx[key].rows.indexOf(t) >= 0) t = text + " (" + (n++) + ")";   /* grid rows must be unique */
+      idx[key].rows.push(t);
+    });
+    var data = sections.map(function (x) {
+      return { title: x.title + (x.kind === "freq" ? " (how often)" : ""), freq: x.kind === "freq", rows: x.rows };
+    });
+    return [
+      "/* " + (st.title || "Survey") + ": creates a Google Form (and a linked Google Sheet for responses).",
+      " * 1. Go to https://script.google.com and click New project.",
+      " * 2. Delete the sample code, paste this whole script, and click Save.",
+      " * 3. Click Run (createForm) and approve the permission prompts.",
+      " * 4. Open the execution log: \"Share this link\" is the link for respondents. */",
+      "function createForm() {",
+      "  var DIFF = " + JSON.stringify(labels("diff")) + ";",
+      "  var FREQ = " + JSON.stringify(labels("freq")) + ";",
+      "  var SECTIONS = " + JSON.stringify(data, null, 2).replace(/\n/g, "\n  ") + ";",
+      "  var form = FormApp.create(" + JSON.stringify(st.title || "Survey") + ");",
+      "  form.setDescription(\"Please answer every item honestly. Your answers are anonymous and used only for research.\");",
+      "  form.setProgressBar(true);",
+      "  form.setCollectEmail(false);",
+      "  form.setConfirmationMessage(\"Thank you! Your response has been recorded.\");",
+      "  SECTIONS.forEach(function (s) {",
+      "    form.addGridItem().setTitle(s.title)",
+      "      .setHelpText(s.freq ? \"How often do you do each of these?\" : \"How difficult is each of these for you?\")",
+      "      .setRows(s.rows).setColumns(s.freq ? FREQ : DIFF).setRequired(true);",
+      "  });",
+      "  var ss = SpreadsheetApp.create(" + JSON.stringify((st.title || "Survey") + " responses") + ");",
+      "  form.setDestination(FormApp.DestinationType.SPREADSHEET, ss.getId());",
+      "  Logger.log(\"Share this link (give to respondents): \" + form.getPublishedUrl());",
+      "  Logger.log(\"Edit form (for you): \" + form.getEditUrl());",
+      "  Logger.log(\"Responses sheet: \" + ss.getUrl());",
+      "}"
+    ].join("\n");
+  }
+  function exportCard() {
+    var n = st.qs.filter(function (q) { return (q.text || "").trim(); }).length;
+    return '<div class="sv-card"><h3>Share with respondents</h3>' +
+      '<p class="fine" style="margin:6px 0 12px">Turn these ' + n + " question" + (n === 1 ? "" : "s") + " into a Google Form that anyone can answer by link. Click the button, then follow the steps at the top of the copied script. Answers collect in a Google Sheet.</p>" +
+      '<div class="sv-row" style="margin:0"><button type="button" class="btn" data-act="gform"' + (n ? "" : " disabled") + "><span>Copy Google Form script</span></button>" +
+      '<button type="button" class="btn btn-quiet" data-act="gformdl"' + (n ? "" : " disabled") + "><span>Download script (.gs)</span></button></div></div>";
+  }
+
   /* ---------- views ---------- */
   function groupsList() {
     var seen = {}, out = [];
@@ -2733,18 +2797,20 @@ window.TASKWISE_DATA = {
     var list = st.qs.length ? st.qs.map(qCard).join("") : ui.emptyState("No questions yet.", "Add your own below, or load the starter survey and edit it.");
     var acts = '<div class="sv-row"><button type="button" class="btn" data-act="add">' + icon("plus", 18) + "<span>Add question</span></button>" +
       (st.qs.length ? "" : '<button type="button" class="btn btn-quiet" data-act="starter"><span>Load starter survey</span></button>') + "</div>";
-    return dl + head + list + acts;
+    return dl + head + list + acts + (st.qs.length ? exportCard() : "");
   }
   function respondView() {
-    if (!st.qs.length) return ui.emptyState("Build the survey first.", "Add at least one question on the Build tab.");
+    if (!st.qs.length) return sh && !sh.editor ? ui.emptyState("This survey is not open yet.", "Please check back later.") : ui.emptyState("Build the survey first.", "Add at least one question on the Build tab.");
+    if (sh && !sh.canWrite) return ui.emptyState("You need contributor access to answer.", "Ask the researcher to invite you as a Contributor, then reopen this page.");
+    if (sh && sh.mine && !sh.again) return '<div class="sv-card"><h3>Thank you!</h3><p class="fine" style="margin:6px 0 10px">Your response to \u201c' + esc(st.title) + '\u201d was recorded.</p><button type="button" class="btn btn-quiet" data-act="again"><span>Change my answers</span></button></div>';
     return '<div class="sv-card"><h3>' + esc(st.title) + '</h3><p class="fine" style="margin:6px 0 0">Answer every item, then submit. Responses are anonymous.</p></div>' +
       st.qs.map(function (q, i) {
         return '<fieldset class="sv-card sv-fs"><legend>' + (i + 1) + ". " + esc(q.text || "(untitled question)") + '</legend><div class="sv-opts">' +
           labels(q.kind).map(function (l, j) { return '<label class="sv-opt"><input type="radio" name="r-' + q.id + '" value="' + (j + 1) + '"><span>' + esc(l) + "</span></label>"; }).join("") + "</div></fieldset>";
       }).join("") +
       '<div class="sv-row"><button type="button" class="btn" data-act="submit">' + icon("check", 18) + "<span>Submit response</span></button>" +
-      '<button type="button" class="btn btn-quiet" data-act="sim"><span>Add 20 sample responses</span></button></div>' +
-      '<p class="fine">' + st.resp.length + " response" + (st.resp.length === 1 ? "" : "s") + " so far.</p>";
+      (sh ? "" : '<button type="button" class="btn btn-quiet" data-act="sim"><span>Add 20 sample responses</span></button>') + "</div>" +
+      (respondOnly() ? "" : '<p class="fine">' + resps().length + " response" + (resps().length === 1 ? "" : "s") + " so far.</p>");
   }
   function bar(mean, k, tier) {
     return '<div class="sv-bar"><i style="width:' + (mean == null ? 0 : mean / 4 * 100).toFixed(1) + "%;background:var(--" + KIND[k].pre + tier + ')"></i></div>';
@@ -2757,9 +2823,9 @@ window.TASKWISE_DATA = {
   }
   function liveView() {
     if (!st.qs.length) return ui.emptyState("Nothing to show yet.", "Build a survey first.");
-    var s = stats(), n = st.resp.length, simN = st.resp.filter(function (r) { return r.sim; }).length;
+    var s = stats(), n = resps().length, simN = resps().filter(function (r) { return r.sim; }).length;
     var kp = '<div class="sv-kpis"><div><b class="num">' + n + '</b>responses</div><div><b class="num">' + st.qs.length + '</b>questions</div><div><b class="num">' + s.groups.length + "</b>groups</div></div>";
-    if (!n) return kp + ui.emptyState("No responses yet.", "Submit a response on the Respond tab, or add sample responses to preview the profile.");
+    if (!n) return kp + ui.emptyState("No responses yet.", sh ? "Share this page with respondents as Contributors. Their answers appear here live." : "Submit a response on the Respond tab, or add sample responses to preview the profile.");
     var diffG = s.groups.filter(function (g) { return g.kind === "diff" && g.mean != null; });
     diffG.forEach(function (g) { g.rank = 1 + diffG.filter(function (o) { return R(o.mean) > R(g.mean); }).length; });
     var hi = diffG.filter(function (g) { return g.band.tier >= 3; }).sort(function (a, b) { return b.mean - a.mean; });
@@ -2779,7 +2845,7 @@ window.TASKWISE_DATA = {
         '<p class="fine" style="margin:8px 0 0">' + (x.n ? 'mean <span class="num strong">' + x.mean.toFixed(2) + "</span> from " + x.n + " answers" : "No answers yet") + "</p></div>";
     }).join("");
     var acts = '<div class="sv-row"><button type="button" class="btn" data-act="copy"><span>Copy results (CSV)</span></button>' +
-      (simN ? '<button type="button" class="btn btn-quiet" data-act="rmsim"><span>Remove sample responses</span></button>' : "") +
+      (simN && !sh ? '<button type="button" class="btn btn-quiet" data-act="rmsim"><span>Remove sample responses</span></button>' : "") +
       '<button type="button" class="btn btn-quiet" data-act="clear"><span>Clear all responses</span></button></div>';
     return kp + note + sum + "<h2 style=\"margin:18px 0 12px\">Profile by group</h2>" + gHtml + "<h2 style=\"margin:18px 0 12px\">Every question</h2>" + qHtml + acts;
   }
@@ -2804,6 +2870,8 @@ window.TASKWISE_DATA = {
       var ins = body.querySelectorAll('[data-f="text"]'); if (ins.length) ins[ins.length - 1].focus();
     } else if (a === "del") {
       var id = b.getAttribute("data-id"); st.qs = st.qs.filter(function (q) { return q.id !== id; }); save(); draw();
+    } else if (a === "gform") { ui.copyText(formScript(), "Script copied. Paste it into a new project at script.google.com.");
+    } else if (a === "gformdl") { ui.download("survey-google-form.gs", formScript(), "text/plain");
     } else if (a === "starter") { starter(); save(); draw(); }
     else if (a === "submit") {
       var ans = {}, miss = null;
@@ -2812,16 +2880,84 @@ window.TASKWISE_DATA = {
         if (c) ans[q.id] = +c.value; else if (!miss) miss = q;
       });
       if (miss) { ui.toast("Please answer every question before submitting."); var f = body.querySelector('input[name="r-' + miss.id + '"]'); if (f) f.focus(); return; }
+      if (sh) {
+        b.disabled = true;
+        sh.db.doc("responses/" + sh.uid).set({ t: Date.now(), a: ans }).then(function () {
+          sh.mine = true; sh.again = false; draw(); ui.toast("Response recorded. Thank you!");
+        }, function () { b.disabled = false; ui.toast("Could not submit. Check your connection and access, then try again."); });
+        return;
+      }
       st.resp.push({ t: Date.now(), a: ans }); save(); draw();
       ui.toast("Response recorded. Open the Live profile tab to see the update.");
-    } else if (a === "sim") { sample(20); save(); draw(); ui.toast("Added 20 sample responses, marked as samples."); }
+    } else if (a === "again") { sh.again = true; draw(); }
+    else if (a === "sim") { sample(20); save(); draw(); ui.toast("Added 20 sample responses, marked as samples."); }
     else if (a === "copy") ui.copyText(csv(), "Results copied as CSV.");
     else if (a === "rmsim") { st.resp = st.resp.filter(function (r) { return !r.sim; }); save(); draw(); }
     else if (a === "clear") {
       var sp = b.querySelector("span");
       if (!armed) { armed = true; sp.textContent = "Click again to confirm"; setTimeout(function () { armed = false; if (sp.isConnected) sp.textContent = "Clear all responses"; }, 4000); return; }
-      armed = false; st.resp = []; save(); draw();
+      armed = false;
+      if (sh) { sh.resp.map(function (r) { return r.id; }).forEach(function (id) { sh.db.doc("responses/" + id).delete().catch(function () {}); }); }
+      else { st.resp = []; save(); draw(); }
     }
+  }
+
+  /* ---------- shared (database) mode ---------- */
+  function initShared() {
+    if (shInit) return; shInit = true;
+    if (!window.claude || !window.claude.use) return;
+    var db, user;
+    Promise.all([window.claude.use("db"), window.claude.use("user")]).then(function (r) {
+      db = r[0]; user = r[1];
+      if (!db || !user) return null;
+      return Promise.all([user.id(), user.canEdit(), user.can("data.write")]);
+    }).then(function (r) {
+      if (!r) return;
+      sh = { db: db, uid: r[0], editor: !!r[1], canWrite: r[2] !== false, def: null, resp: [], mine: false, again: false, seen: false };
+      db.doc("survey/def").onSnapshot(function (snap) {
+        var d = snap.exists ? snap.data() : null;
+        if (sh.editor) {
+          if (!sh.seen) {
+            sh.seen = true;
+            if (d && Array.isArray(d.qs)) { load(); st.title = d.title || st.title; st.qs = d.qs.map(function (q) { return { id: q.id, group: q.group, text: q.text, kind: q.kind }; }); ui.store.set(KEY, st); }
+            else { load(); if (st.qs.length) pushDef(); }
+          }
+        } else { sh.def = d; }
+        paint();
+      }, function () { sh.err = true; });
+      db.doc("responses/" + sh.uid).onSnapshot(function (snap) { sh.mine = snap.exists; paint(); }, function () {});
+      if (sh.editor) {
+        db.collection("responses").onSnapshot(function (snap) {
+          sh.resp = snap.docs.map(function (d) { var v = d.data() || {}; return { id: d.id, t: v.t, a: v.a || {} }; });
+          if (tab === "live") draw();
+        }, function () {});
+      }
+    }).catch(function () {});
+  }
+  function shellHtml() {
+    var opts = respondOnly() ? null : [{ value: "build", label: "Build", icon: "list" }, { value: "respond", label: "Respond", icon: "check" }, { value: "live", label: "Live profile", icon: "chart" }];
+    if (respondOnly()) tab = "respond";
+    return (opts ? ui.segmented("svtab", opts, tab, "Survey sections") : "") + '<div id="sv-body" style="margin-top:16px">' + view() + "</div>";
+  }
+  function paint() {
+    if (!shellEl || !shellEl.isConnected) return;
+    load();
+    var active = document.activeElement;
+    if (active && shellEl.contains(active) && /^(INPUT|SELECT)$/.test(active.tagName) && active.hasAttribute("data-f")) return;   /* do not disturb typing */
+    shellEl.innerHTML = shellHtml();
+    var lead = document.querySelector("header.page-head .lead"); if (lead) lead.textContent = leadText();
+    body = shellEl.querySelector("#sv-body");
+    ui.wireSegmented(shellEl, "svtab", function (v) { tab = v; draw(); });
+  }
+  function formCard() {
+    if (!/^https:\/\//.test(FORM_URL)) return "";
+    return '<div class="sv-card"><h3>Take the TaskWise survey</h3><p class="fine" style="margin:6px 0 12px">Answer the questionnaire used in this research. It takes about 5 minutes and your answers are anonymous.</p>' +
+      '<a class="btn" href="' + esc(FORM_URL) + '" target="_blank" rel="noopener noreferrer"><span>Open the survey form</span></a></div>';
+  }
+  function leadText() {
+    return sh ? (sh.editor ? "Write your questions here. They save automatically for respondents, and every answer appears in the Live profile tab as it arrives."
+      : "Answer each statement honestly. Your response is saved anonymously to the survey.")
+      : "Write your own questions, collect responses, and watch the student profile update with every answer. Responses stay in this browser and are not sent anywhere.";
   }
 
   TW.pages = TW.pages || {};
@@ -2829,18 +2965,18 @@ window.TASKWISE_DATA = {
     title: "Live Survey",
     render: function () {
       load();
-      return ui.pageHead({ title: "Live survey", lead: "Write your own questions, collect responses, and watch the student profile update with every answer. Responses stay in this browser and are not sent anywhere." }) +
-        ui.segmented("svtab", [{ value: "build", label: "Build", icon: "list" }, { value: "respond", label: "Respond", icon: "check" }, { value: "live", label: "Live profile", icon: "chart" }], tab, "Survey sections") +
-        '<div id="sv-body" style="margin-top:16px">' + view() + "</div>";
+      return ui.pageHead({ title: "Live survey", lead: leadText() }) + formCard() + '<div id="sv-shell">' + shellHtml() + "</div>";
     },
     mount: function (main) {
+      shellEl = main.querySelector("#sv-shell");
       body = main.querySelector("#sv-body");
       ui.wireSegmented(main, "svtab", function (v) { tab = v; draw(); });
-      body.addEventListener("input", onInput);
-      body.addEventListener("click", onClick);
-      function onStore(e) { if (e.key === "taskwise:" + KEY && tab === "live") { load(); draw(); } }
+      shellEl.addEventListener("input", onInput);
+      shellEl.addEventListener("click", onClick);
+      function onStore(e) { if (e.key === "taskwise:" + KEY && tab === "live" && !sh) { load(); draw(); } }
       window.addEventListener("storage", onStore);
-      ui.onLeave(function () { window.removeEventListener("storage", onStore); body = null; });
+      ui.onLeave(function () { window.removeEventListener("storage", onStore); body = null; shellEl = null; });
+      if (shInit && sh) paint(); else initShared();
     }
   };
 })(window.TW = window.TW || {});
